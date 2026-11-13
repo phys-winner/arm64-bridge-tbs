@@ -1,0 +1,103 @@
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -316,6 +316,22 @@
+             code.B(LE, return_from_run_code);
+         }
+ 
++        // Same exact-descriptor fast dispatch as the x64 backend, after halt/tick checks.
++        oaknut::Label fast_miss, l_fast_table;
++        if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            code.LDUR(X1, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++            code.LSR(X2, X1, 1);
++            code.AND(X2, X2, FastDispatchCount - 1);
++            code.LDR(X0, l_fast_table);
++            code.ADD(X0, X0, X2, LSL, 4);
++            code.LDP(X3, X4, X0);
++            code.CMP(X1, X3);
++            code.B(NE, fast_miss);
++            code.CBZ(X4, fast_miss);
++            code.BR(X4);
++            code.l(fast_miss);
++        }
++
+         code.LDR(X0, l_this);
+         code.MOV(X1, Xstate);
+         code.LDR(Xscratch0, l_addr);
+@@ -327,6 +343,10 @@
+         };
+ 
+         code.align(8);
++        if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            code.l(l_fast_table);
++            code.dx(mcl::bit_cast<u64>(fast_dispatch_table.data()));
++        }
+         code.l(l_this);
+         code.dx(mcl::bit_cast<u64>(this));
+         code.l(l_addr);
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -61,19 +61,23 @@
+ }
+ 
+ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
+-    if (CodePtr block_entry = Get(descriptor)) {
+-        return block_entry;
+-    }
+-
+-    IR::Block ir_block = GenerateIR(descriptor);
+-    const EmittedBlockInfo block_info = Emit(std::move(ir_block));
+-    return block_info.entry_point;
++    CodePtr block_entry = Get(descriptor);
++    if (!block_entry) {
++        IR::Block ir_block = GenerateIR(descriptor);
++        block_entry = Emit(std::move(ir_block)).entry_point;
++    }
++    fast_dispatch_table[(descriptor.Value() >> 1) & (FastDispatchCount - 1)] = {descriptor.Value(), block_entry};
++    return block_entry;
+ }
+ 
+ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
+     UnprotectCodeMemory();
+ 
+     for (const auto& descriptor : descriptors) {
++        auto& fast = fast_dispatch_table[(descriptor.Value() >> 1) & (FastDispatchCount - 1)];
++        if (fast.descriptor == descriptor.Value()) {
++            fast = {};
++        }
+         const auto iter = block_entries.find(descriptor);
+         if (iter == block_entries.end()) {
+             continue;
+@@ -90,6 +94,7 @@
+ }
+ 
+ void AddressSpace::ClearCache() {
++    fast_dispatch_table.fill({});
+     block_entries.clear();
+     reverse_block_entries.clear();
+     block_infos.clear();
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -5,6 +5,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <map>
+ #include <optional>
+ 
+@@ -73,6 +74,15 @@
+     oaknut::CodeBlock mem;
+     oaknut::CodeGenerator code;
+ 
++    struct FastDispatchEntry {
++        u64 descriptor = 0;
++        CodePtr code_ptr = nullptr;
++    };
++    static_assert(sizeof(FastDispatchEntry) == 16);
++    // ponytail: 64-KiB direct table; collisions use the exact block map. Resize only after measuring misses.
++    static constexpr size_t FastDispatchCount = 4096;
++    std::array<FastDispatchEntry, FastDispatchCount> fast_dispatch_table{};
++
+     // A IR::LocationDescriptor will have one current CodePtr.
+     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
+     tsl::robin_map<IR::LocationDescriptor, CodePtr> block_entries;

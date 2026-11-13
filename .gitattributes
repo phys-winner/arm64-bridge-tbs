@@ -1,0 +1,9 @@
+*.md text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+LICENSE text eol=lf
+# Preserve the existing bridge and dependency source bytes.
+/arm64_bridge/** -text
+/tools/android/** -text
+# The packer pins these inputs by SHA-256, including line endings.
+/work/research_cache/** -text
